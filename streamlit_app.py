@@ -4,7 +4,46 @@ import json
 import httpx
 import streamlit as st
 
-from app.config import API_URL
+from app.config import API_URL as _CONFIG_API_URL
+
+
+def resolve_api_url() -> str:
+    """Prefer Streamlit Cloud secrets, then env / .env from app.config."""
+    try:
+        url = st.secrets.get("API_URL")
+        if url:
+            return str(url).rstrip("/")
+    except Exception:
+        pass
+    return _CONFIG_API_URL.rstrip("/")
+
+
+API_URL = resolve_api_url()
+
+
+def api_error_detail(exc: httpx.HTTPStatusError) -> str:
+    """Extract a user-facing message when the API error body is not JSON."""
+    try:
+        payload = exc.response.json()
+        if isinstance(payload, dict):
+            detail = payload.get("detail", payload)
+            if isinstance(detail, list):
+                return "; ".join(
+                    item.get("msg", str(item)) if isinstance(item, dict) else str(item)
+                    for item in detail
+                )
+            return str(detail)
+        return str(payload)
+    except (json.JSONDecodeError, ValueError):
+        text = (exc.response.text or "").strip()
+        if text:
+            snippet = text[:500] + ("..." if len(text) > 500 else "")
+            return f"HTTP {exc.response.status_code}: {snippet}"
+        return (
+            f"HTTP {exc.response.status_code} from API. "
+            "If your Render service was sleeping, wait a minute and try again."
+        )
+
 
 st.set_page_config(
     page_title="Natural Care Assistant",
@@ -377,9 +416,17 @@ def show_auth_page() -> None:
                         login_user(email, password)
                         st.success("Welcome back!")
                         st.rerun()
+                    except httpx.ConnectError:
+                        st.error(
+                            f"Cannot reach the API at `{API_URL}`. "
+                            "Set `API_URL` in Streamlit secrets and confirm the Render service is running."
+                        )
+                    except httpx.TimeoutException:
+                        st.error(
+                            "The API timed out. Your Render service may still be waking up — try again."
+                        )
                     except httpx.HTTPStatusError as exc:
-                        detail = exc.response.json().get("detail", str(exc))
-                        st.error(detail)
+                        st.error(api_error_detail(exc))
                     except Exception as exc:
                         st.error(str(exc))
 
@@ -406,9 +453,17 @@ def show_auth_page() -> None:
                         register_user(email, password)
                         st.success("Account created!")
                         st.rerun()
+                    except httpx.ConnectError:
+                        st.error(
+                            f"Cannot reach the API at `{API_URL}`. "
+                            "Set `API_URL` in Streamlit secrets and confirm the Render service is running."
+                        )
+                    except httpx.TimeoutException:
+                        st.error(
+                            "The API timed out. Your Render service may still be waking up — try again."
+                        )
                     except httpx.HTTPStatusError as exc:
-                        detail = exc.response.json().get("detail", str(exc))
-                        st.error(detail)
+                        st.error(api_error_detail(exc))
                     except Exception as exc:
                         st.error(str(exc))
 
@@ -456,7 +511,7 @@ with st.sidebar:
         if exc.response.status_code == 401:
             logout_user()
             st.rerun()
-        detail = exc.response.json().get("detail", str(exc))
+        detail = api_error_detail(exc)
         st.caption(f"Could not load conversations: {detail}")
     except Exception as exc:
         st.caption(f"Could not load conversations: {exc}")
@@ -468,7 +523,7 @@ with st.sidebar:
                 start_new_chat()
                 st.rerun()
             except httpx.HTTPStatusError as exc:
-                detail = exc.response.json().get("detail", str(exc))
+                detail = api_error_detail(exc)
                 st.error(detail)
             except Exception as exc:
                 st.error(str(exc))
@@ -528,7 +583,7 @@ with st.sidebar:
                     )
                     st.rerun()
                 except httpx.HTTPStatusError as exc:
-                    detail = exc.response.json().get("detail", str(exc))
+                    detail = api_error_detail(exc)
                     st.error(detail)
                 except Exception as exc:
                     st.error(str(exc))
@@ -561,7 +616,7 @@ with st.sidebar:
                     )
                     st.rerun()
                 except httpx.HTTPStatusError as exc:
-                    detail = exc.response.json().get("detail", str(exc))
+                    detail = api_error_detail(exc)
                     st.error(detail)
                 except Exception as exc:
                     st.error(str(exc))
@@ -621,7 +676,7 @@ def answer_pending_prompt() -> None:
                 if exc.response.status_code == 401:
                     logout_user()
                     st.rerun()
-                detail = exc.response.json().get("detail", str(exc))
+                detail = api_error_detail(exc)
                 st.session_state.messages.append(
                     {"role": "assistant", "content": f"⚠️ {detail}"}
                 )
@@ -666,7 +721,7 @@ def analyze_pending_photo() -> None:
                 if exc.response.status_code == 401:
                     logout_user()
                     st.rerun()
-                detail = exc.response.json().get("detail", str(exc))
+                detail = api_error_detail(exc)
                 st.session_state.messages.append(
                     {"role": "assistant", "content": f"⚠️ {detail}"}
                 )
@@ -778,7 +833,7 @@ if audio is not None:
                 if exc.response.status_code == 401:
                     logout_user()
                     st.rerun()
-                detail = exc.response.json().get("detail", str(exc))
+                detail = api_error_detail(exc)
                 st.error(detail)
             except Exception as exc:
                 st.error(f"Could not transcribe audio: {exc}")
