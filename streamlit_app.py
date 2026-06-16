@@ -1,3 +1,8 @@
+import os
+
+# Must run before chromadb/protobuf-dependent imports on Streamlit Cloud.
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
 import hashlib
 
 import streamlit as st
