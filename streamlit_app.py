@@ -1,48 +1,32 @@
 import hashlib
-import json
 
-import httpx
 import streamlit as st
 
-from app.config import API_URL as _CONFIG_API_URL
+from app.services import (
+    AppError,
+    analyze_photo as analyze_photo_service,
+    ask as ask_service,
+    ensure_initialized,
+    get_conversation_detail,
+    get_conversations,
+    health_check,
+    login,
+    register,
+    reingest_documents,
+    remove_conversation,
+    require_user,
+    transcribe as transcribe_service,
+    upload_pdfs as upload_pdfs_service,
+)
 
 
-def resolve_api_url() -> str:
-    """Prefer Streamlit Cloud secrets, then env / .env from app.config."""
-    try:
-        url = st.secrets.get("API_URL")
-        if url:
-            return str(url).rstrip("/")
-    except Exception:
-        pass
-    return _CONFIG_API_URL.rstrip("/")
+@st.cache_resource
+def init_backend() -> bool:
+    ensure_initialized()
+    return True
 
 
-API_URL = resolve_api_url()
-
-
-def api_error_detail(exc: httpx.HTTPStatusError) -> str:
-    """Extract a user-facing message when the API error body is not JSON."""
-    try:
-        payload = exc.response.json()
-        if isinstance(payload, dict):
-            detail = payload.get("detail", payload)
-            if isinstance(detail, list):
-                return "; ".join(
-                    item.get("msg", str(item)) if isinstance(item, dict) else str(item)
-                    for item in detail
-                )
-            return str(detail)
-        return str(payload)
-    except (json.JSONDecodeError, ValueError):
-        text = (exc.response.text or "").strip()
-        if text:
-            snippet = text[:500] + ("..." if len(text) > 500 else "")
-            return f"HTTP {exc.response.status_code}: {snippet}"
-        return (
-            f"HTTP {exc.response.status_code} from API. "
-            "If your Render service was sleeping, wait a minute and try again."
-        )
+init_backend()
 
 
 st.set_page_config(
@@ -247,82 +231,12 @@ if "processed_photo_keys" not in st.session_state:
     st.session_state.processed_photo_keys = set()
 
 
-def auth_headers() -> dict:
-    if st.session_state.access_token:
-        return {"Authorization": f"Bearer {st.session_state.access_token}"}
-    return {}
-
-
-def call_api(method: str, path: str, json: dict | None = None) -> dict:
-    with httpx.Client(timeout=120.0) as client:
-        response = client.request(
-            method,
-            f"{API_URL}{path}",
-            json=json,
-            headers=auth_headers(),
-        )
-        response.raise_for_status()
-        return response.json()
-
-
-def upload_pdfs(files) -> dict:
-    multipart = [
-        ("files", (f.name, f.getvalue(), "application/pdf"))
-        for f in files
-    ]
-    with httpx.Client(timeout=300.0) as client:
-        response = client.post(
-            f"{API_URL}/upload",
-            files=multipart,
-            headers=auth_headers(),
-        )
-        response.raise_for_status()
-        return response.json()
-
-
-def analyze_photo(
-    image_bytes: bytes,
-    filename: str,
-    mime: str,
-    note: str,
-    profile: dict,
-    conversation_id: str | None,
-) -> dict:
-    data: dict = {}
-    if note:
-        data["note"] = note
-    if profile:
-        data["profile"] = json.dumps(profile)
-    if conversation_id:
-        data["conversation_id"] = conversation_id
-    with httpx.Client(timeout=180.0) as client:
-        response = client.post(
-            f"{API_URL}/analyze-photo",
-            files={"file": (filename, image_bytes, mime or "image/jpeg")},
-            data=data,
-            headers=auth_headers(),
-        )
-        response.raise_for_status()
-        return response.json()
-
-
-def transcribe_audio(audio_bytes: bytes, filename: str) -> str:
-    with httpx.Client(timeout=120.0) as client:
-        response = client.post(
-            f"{API_URL}/transcribe",
-            files={"file": (filename, audio_bytes, "audio/wav")},
-            headers=auth_headers(),
-        )
-        response.raise_for_status()
-        return response.json()["text"]
+def current_user() -> dict:
+    return require_user(st.session_state.access_token)
 
 
 def login_user(email: str, password: str) -> None:
-    result = call_api(
-        "POST",
-        "/auth/login",
-        json={"email": email, "password": password},
-    )
+    result = login(email, password)
     st.session_state.access_token = result["access_token"]
     st.session_state.user_email = result["user"]["email"]
     st.session_state.messages = []
@@ -330,11 +244,7 @@ def login_user(email: str, password: str) -> None:
 
 
 def register_user(email: str, password: str) -> None:
-    result = call_api(
-        "POST",
-        "/auth/register",
-        json={"email": email, "password": password},
-    )
+    result = register(email, password)
     st.session_state.access_token = result["access_token"]
     st.session_state.user_email = result["user"]["email"]
     st.session_state.messages = []
@@ -360,7 +270,7 @@ def upload_file_key(file) -> str:
 
 
 def load_conversation(conversation_id: str) -> None:
-    data = call_api("GET", f"/conversations/{conversation_id}")
+    data = get_conversation_detail(current_user(), conversation_id)
     st.session_state.conversation_id = conversation_id
     st.session_state.messages = [
         {
@@ -416,17 +326,8 @@ def show_auth_page() -> None:
                         login_user(email, password)
                         st.success("Welcome back!")
                         st.rerun()
-                    except httpx.ConnectError:
-                        st.error(
-                            f"Cannot reach the API at `{API_URL}`. "
-                            "Set `API_URL` in Streamlit secrets and confirm the Render service is running."
-                        )
-                    except httpx.TimeoutException:
-                        st.error(
-                            "The API timed out. Your Render service may still be waking up — try again."
-                        )
-                    except httpx.HTTPStatusError as exc:
-                        st.error(api_error_detail(exc))
+                    except AppError as exc:
+                        st.error(exc.detail)
                     except Exception as exc:
                         st.error(str(exc))
 
@@ -453,17 +354,8 @@ def show_auth_page() -> None:
                         register_user(email, password)
                         st.success("Account created!")
                         st.rerun()
-                    except httpx.ConnectError:
-                        st.error(
-                            f"Cannot reach the API at `{API_URL}`. "
-                            "Set `API_URL` in Streamlit secrets and confirm the Render service is running."
-                        )
-                    except httpx.TimeoutException:
-                        st.error(
-                            "The API timed out. Your Render service may still be waking up — try again."
-                        )
-                    except httpx.HTTPStatusError as exc:
-                        st.error(api_error_detail(exc))
+                    except AppError as exc:
+                        st.error(exc.detail)
                     except Exception as exc:
                         st.error(str(exc))
 
@@ -490,7 +382,7 @@ with st.sidebar:
         st.rerun()
 
     try:
-        conversations = call_api("GET", "/conversations")
+        conversations = get_conversations(current_user())
         if conversations:
             for conversation in conversations:
                 is_active = conversation["id"] == st.session_state.conversation_id
@@ -507,24 +399,22 @@ with st.sidebar:
                     st.rerun()
         else:
             st.caption("No saved conversations yet.")
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 401:
+    except AppError as exc:
+        if exc.status_code == 401:
             logout_user()
             st.rerun()
-        detail = api_error_detail(exc)
-        st.caption(f"Could not load conversations: {detail}")
+        st.caption(f"Could not load conversations: {exc.detail}")
     except Exception as exc:
         st.caption(f"Could not load conversations: {exc}")
 
     if st.session_state.conversation_id:
         if st.button("Delete this conversation", use_container_width=True):
             try:
-                call_api("DELETE", f"/conversations/{st.session_state.conversation_id}")
+                remove_conversation(current_user(), st.session_state.conversation_id)
                 start_new_chat()
                 st.rerun()
-            except httpx.HTTPStatusError as exc:
-                detail = api_error_detail(exc)
-                st.error(detail)
+            except AppError as exc:
+                st.error(exc.detail)
             except Exception as exc:
                 st.error(str(exc))
 
@@ -571,7 +461,10 @@ with st.sidebar:
                 f"Indexing {len(pending)} PDF{'s' if len(pending) != 1 else ''}..."
             ):
                 try:
-                    result = upload_pdfs(pending)
+                    result = upload_pdfs_service(
+                        current_user(),
+                        [(f.name, f.getvalue()) for f in pending],
+                    )
                     for f in pending:
                         st.session_state.processed_upload_keys.add(
                             upload_file_key(f)
@@ -582,15 +475,14 @@ with st.sidebar:
                         f"from {result['files_processed']} file(s)."
                     )
                     st.rerun()
-                except httpx.HTTPStatusError as exc:
-                    detail = api_error_detail(exc)
-                    st.error(detail)
+                except AppError as exc:
+                    st.error(exc.detail)
                 except Exception as exc:
                     st.error(str(exc))
 
     try:
-        health = call_api("GET", "/health")
-        st.success("API connected")
+        health = health_check()
+        st.success("Backend ready")
         st.write(f"Documents: **{health['pdf_count']}**")
         st.write(f"Indexed sections: **{health['indexed_chunks']}**")
 
@@ -601,7 +493,7 @@ with st.sidebar:
         elif health["pdf_count"] == 0:
             st.info("Upload a PDF above to start asking questions.")
     except Exception as exc:
-        st.error(f"API not reachable at {API_URL}")
+        st.error("Backend could not start.")
         st.caption(str(exc))
         health = None
 
@@ -609,19 +501,16 @@ with st.sidebar:
         if st.button("Re-index all documents", use_container_width=True):
             with st.spinner("Rebuilding search index..."):
                 try:
-                    result = call_api("POST", "/ingest")
+                    result = reingest_documents(current_user())
                     st.success(
                         f"Re-indexed {result['chunks_indexed']} sections "
                         f"from {result['files_processed']} document(s)."
                     )
                     st.rerun()
-                except httpx.HTTPStatusError as exc:
-                    detail = api_error_detail(exc)
-                    st.error(detail)
+                except AppError as exc:
+                    st.error(exc.detail)
                 except Exception as exc:
                     st.error(str(exc))
-
-    st.caption(f"Backend: `{API_URL}`")
 
 def current_profile() -> dict:
     return {
@@ -653,15 +542,12 @@ def answer_pending_prompt() -> None:
     with st.chat_message("assistant", avatar="🌿"):
         with st.spinner("Searching the web..." if web_search else "Thinking..."):
             try:
-                result = call_api(
-                    "POST",
-                    "/ask",
-                    json={
-                        "question": prompt,
-                        "profile": current_profile() or None,
-                        "conversation_id": st.session_state.conversation_id,
-                        "web_search": web_search,
-                    },
+                result = ask_service(
+                    current_user(),
+                    prompt,
+                    profile=current_profile() or None,
+                    conversation_id=st.session_state.conversation_id,
+                    web_search=web_search,
                 )
                 st.session_state.conversation_id = result["conversation_id"]
                 st.session_state.messages.append(
@@ -672,13 +558,12 @@ def answer_pending_prompt() -> None:
                         "used_web_fallback": result.get("used_web_fallback", False),
                     }
                 )
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 401:
+            except AppError as exc:
+                if exc.status_code == 401:
                     logout_user()
                     st.rerun()
-                detail = api_error_detail(exc)
                 st.session_state.messages.append(
-                    {"role": "assistant", "content": f"⚠️ {detail}"}
+                    {"role": "assistant", "content": f"⚠️ {exc.detail}"}
                 )
             except Exception as exc:
                 st.session_state.messages.append(
@@ -700,13 +585,14 @@ def analyze_pending_photo() -> None:
     with st.chat_message("assistant", avatar="🌿"):
         with st.spinner("Analyzing your photo and finding natural products..."):
             try:
-                result = analyze_photo(
+                result = analyze_photo_service(
+                    current_user(),
                     photo["bytes"],
                     photo["name"],
                     photo["mime"],
-                    photo["note"],
-                    current_profile(),
-                    st.session_state.conversation_id,
+                    note=photo["note"],
+                    profile=current_profile() or None,
+                    conversation_id=st.session_state.conversation_id,
                 )
                 st.session_state.conversation_id = result["conversation_id"]
                 st.session_state.messages.append(
@@ -717,13 +603,12 @@ def analyze_pending_photo() -> None:
                         "used_web_fallback": result.get("used_web_fallback", False),
                     }
                 )
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 401:
+            except AppError as exc:
+                if exc.status_code == 401:
                     logout_user()
                     st.rerun()
-                detail = api_error_detail(exc)
                 st.session_state.messages.append(
-                    {"role": "assistant", "content": f"⚠️ {detail}"}
+                    {"role": "assistant", "content": f"⚠️ {exc.detail}"}
                 )
             except Exception as exc:
                 st.session_state.messages.append(
@@ -826,15 +711,16 @@ if audio is not None:
         st.session_state.processed_audio_keys.add(audio_key)
         with st.spinner("Transcribing..."):
             try:
-                transcript = transcribe_audio(audio_bytes, "recording.wav")
+                transcript = transcribe_service(
+                    current_user(), audio_bytes, "recording.wav"
+                )
                 st.session_state.voice_prompt = transcript
                 st.rerun()
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 401:
+            except AppError as exc:
+                if exc.status_code == 401:
                     logout_user()
                     st.rerun()
-                detail = api_error_detail(exc)
-                st.error(detail)
+                st.error(exc.detail)
             except Exception as exc:
                 st.error(f"Could not transcribe audio: {exc}")
 
